@@ -1,6 +1,5 @@
 #include "il2cpp_dump.h"
 #include "log.h"
-#include "xdl.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -61,7 +60,7 @@ static uint64_t  g_cam_tick    = 0;
 static uint64_t  g_hb_tick     = 0;
 static EnemySlot g_seen[96]    = {};
 
-// IL2CPP C API (chi dung cac symbol da duoc xac thuc ton tai qua Perfare dumper)
+// IL2CPP C API (dung dlsym chuan nhu ban Perfare goc)
 using FnDomainGet      = void*       (*)();
 using FnGetAsms        = void**      (*)(void*, size_t*);
 using FnAsmGetImg      = void*       (*)(void*);
@@ -70,6 +69,7 @@ using FnImgGetClass    = void*       (*)(void*, size_t);
 using FnClsGetName     = const char* (*)(void*);
 using FnClsGetNs       = const char* (*)(void*);
 using FnClsGetMethods  = void*       (*)(void*, void**);
+using FnClsAssignable  = bool        (*)(void*, void*);
 using FnMtdGetName     = const char* (*)(void*);
 using FnMtdParamCount  = uint32_t    (*)(void*);
 using FnIsVmThread     = bool        (*)(void*);
@@ -83,6 +83,7 @@ static FnImgGetClass   api_image_get_class        = nullptr;
 static FnClsGetName    api_class_get_name         = nullptr;
 static FnClsGetNs      api_class_get_namespace    = nullptr;
 static FnClsGetMethods api_class_get_methods      = nullptr;
+static FnClsAssignable api_class_is_assignable    = nullptr;
 static FnMtdGetName    api_method_get_name        = nullptr;
 static FnMtdParamCount api_method_get_param_count = nullptr;
 static FnIsVmThread    api_is_vm_thread           = nullptr;
@@ -124,14 +125,6 @@ static inline bool IsValidPtr(const void* p) {
     return a > 0x100000000ULL && a < 0x7FFFFFFFFFULL && (a & 0x3ULL) == 0;
 }
 
-static void* XdlSymSafe(void* handle, const char* name) {
-    if (!handle) return nullptr;
-    void* s = xdl_sym(handle, name, nullptr);
-    if (!s) s = xdl_dsym(handle, name, nullptr);
-    return s;
-}
-
-// Doc bo nho an toan tuyet doi (khong bao gio SIGSEGV khi quet VTable)
 static bool SafeReadPtr(const void* addr, void** outVal) {
     int pfd[2];
     if (pipe(pfd) != 0) return false;
@@ -334,7 +327,6 @@ static void RunHeadLock() {
     float   bestDist   = g_cfg.fov;
     int     aliveCount = 0;
 
-    // Nguon 1: Quet Match Dictionary
     void* match = fn_CurrentMatch(nullptr);
     if (IsValidPtr(match)) {
         if (g_dict_off == 0) DetectPlayersDict(match, localPlayer);
@@ -362,7 +354,6 @@ static void RunHeadLock() {
         }
     }
 
-    // Nguon 2 (du phong): Danh sach Player thu thap tu OnUpdate
     if (aliveCount == 0) {
         for (int i = 0; i < 96; ++i) {
             if (!g_seen[i].ptr) continue;
@@ -424,26 +415,22 @@ static bool PatchClassVTableSafe(
     void* hookFn, void** outOrig, const char* label)
 {
     if (!klass || !methodInfo) return false;
-    void* expectedPtr = reinterpret_cast<void*>(g_base + expectedRva);
+    // Ep IL2CPP nap VTable sach (khong chay .cctor)
+    if (api_class_is_assignable) api_class_is_assignable(klass, klass);
 
+    void* expectedPtr = reinterpret_cast<void*>(g_base + expectedRva);
     void* slot0 = nullptr;
     void* slot1 = nullptr;
     SafeReadPtr(methodInfo, &slot0);
     SafeReadPtr(reinterpret_cast<uint8_t*>(methodInfo) + sizeof(void*), &slot1);
 
-    void* matchPtr = expectedPtr;
-    if (slot0 == expectedPtr) matchPtr = slot0;
-    else if (slot1 == expectedPtr) matchPtr = slot1;
-    else if (IsValidPtr(slot0)) matchPtr = slot0;
-    else return false;
-
     void** raw = reinterpret_cast<void**>(klass);
     bool patched = false;
-    for (int i = 20; i < 420; ++i) {
+    for (int i = 20; i < 1200; ++i) {
         void* v0 = nullptr;
         void* v1 = nullptr;
         if (!SafeReadPtr(&raw[i], &v0) || !SafeReadPtr(&raw[i + 1], &v1)) break;
-        if (v0 == matchPtr && v1 == methodInfo) {
+        if (v1 == methodInfo && (v0 == expectedPtr || (IsValidPtr(slot0) && v0 == slot0) || (IsValidPtr(slot1) && v0 == slot1))) {
             if (*outOrig == nullptr) *outOrig = v0;
             raw[i] = hookFn;
             patched = true;
@@ -452,7 +439,7 @@ static bool PatchClassVTableSafe(
         }
     }
 
-    if (slot0 == matchPtr) {
+    if (slot0 == expectedPtr) {
         if (*outOrig == nullptr) *outOrig = slot0;
         reinterpret_cast<void**>(methodInfo)[0] = hookFn;
     }
@@ -476,8 +463,8 @@ static bool InstallAllHooks() {
     void** asms = api_domain_get_assemblies(domain, &asmCount);
     if (!asms || asmCount == 0) return false;
 
-    bool okPlayer = false;
-    bool okCam    = false;
+    static bool okPlayer = false;
+    static bool okCam    = false;
 
     for (size_t i = 0; i < asmCount; ++i) {
         void* img = api_assembly_get_image(asms[i]);
@@ -510,9 +497,9 @@ static bool InstallAllHooks() {
     }
 
     if (okPlayer || okCam) {
-        LOGI("[FFAim] HOOK THANH CONG (HEADLOCK V5) | Player=%d | FollowCam=%d",
+        LOGI("[FFAim] HOOK THANH CONG (HEADLOCK V6) | Player=%d | FollowCam=%d",
              okPlayer ? 1 : 0, okCam ? 1 : 0);
-        return true;
+        return (okPlayer && okCam);
     }
     return false;
 }
@@ -522,26 +509,30 @@ static bool InstallAllHooks() {
 void il2cpp_api_init(void *handle) {
     g_il2cpp_handle = handle;
 #if defined(__aarch64__)
-    LOGI("[FFAim] HEADLOCK V5 il2cpp_handle: %p", handle);
-    api_domain_get             = reinterpret_cast<FnDomainGet>(XdlSymSafe(handle, "il2cpp_domain_get"));
-    api_domain_get_assemblies  = reinterpret_cast<FnGetAsms>(XdlSymSafe(handle, "il2cpp_domain_get_assemblies"));
-    api_assembly_get_image     = reinterpret_cast<FnAsmGetImg>(XdlSymSafe(handle, "il2cpp_assembly_get_image"));
-    api_image_get_class_count  = reinterpret_cast<FnImgClassCount>(XdlSymSafe(handle, "il2cpp_image_get_class_count"));
-    api_image_get_class        = reinterpret_cast<FnImgGetClass>(XdlSymSafe(handle, "il2cpp_image_get_class"));
-    api_class_get_name         = reinterpret_cast<FnClsGetName>(XdlSymSafe(handle, "il2cpp_class_get_name"));
-    api_class_get_namespace    = reinterpret_cast<FnClsGetNs>(XdlSymSafe(handle, "il2cpp_class_get_namespace"));
-    api_class_get_methods      = reinterpret_cast<FnClsGetMethods>(XdlSymSafe(handle, "il2cpp_class_get_methods"));
-    api_method_get_name        = reinterpret_cast<FnMtdGetName>(XdlSymSafe(handle, "il2cpp_method_get_name"));
-    api_method_get_param_count = reinterpret_cast<FnMtdParamCount>(XdlSymSafe(handle, "il2cpp_method_get_param_count"));
-    api_is_vm_thread           = reinterpret_cast<FnIsVmThread>(XdlSymSafe(handle, "il2cpp_is_vm_thread"));
-    api_thread_attach          = reinterpret_cast<FnThreadAttach>(XdlSymSafe(handle, "il2cpp_thread_attach"));
+    LOGI("[FFAim] HEADLOCK V6 il2cpp_handle: %p", handle);
+    api_domain_get             = reinterpret_cast<FnDomainGet>(dlsym(handle, "il2cpp_domain_get"));
+    api_domain_get_assemblies  = reinterpret_cast<FnGetAsms>(dlsym(handle, "il2cpp_domain_get_assemblies"));
+    api_assembly_get_image     = reinterpret_cast<FnAsmGetImg>(dlsym(handle, "il2cpp_assembly_get_image"));
+    api_image_get_class_count  = reinterpret_cast<FnImgClassCount>(dlsym(handle, "il2cpp_image_get_class_count"));
+    api_image_get_class        = reinterpret_cast<FnImgGetClass>(dlsym(handle, "il2cpp_image_get_class"));
+    api_class_get_name         = reinterpret_cast<FnClsGetName>(dlsym(handle, "il2cpp_class_get_name"));
+    api_class_get_namespace    = reinterpret_cast<FnClsGetNs>(dlsym(handle, "il2cpp_class_get_namespace"));
+    api_class_get_methods      = reinterpret_cast<FnClsGetMethods>(dlsym(handle, "il2cpp_class_get_methods"));
+    api_class_is_assignable    = reinterpret_cast<FnClsAssignable>(dlsym(handle, "il2cpp_class_is_assignable_from"));
+    api_method_get_name        = reinterpret_cast<FnMtdGetName>(dlsym(handle, "il2cpp_method_get_name"));
+    api_method_get_param_count = reinterpret_cast<FnMtdParamCount>(dlsym(handle, "il2cpp_method_get_param_count"));
+    api_is_vm_thread           = reinterpret_cast<FnIsVmThread>(dlsym(handle, "il2cpp_is_vm_thread"));
+    api_thread_attach          = reinterpret_cast<FnThreadAttach>(dlsym(handle, "il2cpp_thread_attach"));
 
     if (api_domain_get_assemblies) {
         Dl_info dlInfo{};
         if (dladdr(reinterpret_cast<void*>(api_domain_get_assemblies), &dlInfo) && dlInfo.dli_fbase) {
             g_base = reinterpret_cast<uintptr_t>(dlInfo.dli_fbase);
         }
-        LOGI("[FFAim] HEADLOCK V5 il2cpp_base: 0x%lx", (unsigned long)g_base);
+        LOGI("[FFAim] HEADLOCK V6 il2cpp_base: 0x%lx", (unsigned long)g_base);
+    } else {
+        LOGE("[FFAim] dlsym il2cpp_domain_get_assemblies that bai!");
+        return;
     }
 
     if (api_is_vm_thread) {
@@ -558,7 +549,7 @@ void il2cpp_dump(const char *outDir) {
     (void)outDir;
 #if defined(__aarch64__)
     if (!g_base) {
-        LOGE("[FFAim] il2cpp_base = 0, huy cai hook de tranh crash!");
+        LOGE("[FFAim] il2cpp_base = 0, huy cai hook!");
         return;
     }
 
@@ -582,9 +573,9 @@ void il2cpp_dump(const char *outDir) {
     fn_IsWholeFiring   = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_IS_WHOLE);
 
     ReloadConfig();
-    for (int retry = 0; retry < 15; ++retry) {
+    for (int retry = 0; retry < 30; ++retry) {
         if (InstallAllHooks()) break;
-        sleep(1);
+        sleep(2);
     }
 #endif
 }
