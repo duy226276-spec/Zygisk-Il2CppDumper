@@ -6,9 +6,10 @@
 #include <cstring>
 #include <cmath>
 #include <unistd.h>
-#include <dlfcn.h>
+#include <link.h>
+#include <vector>
 
-// ===================== VERIFIED RVAs (FROM dump.cs & Exact_Verify_Data.txt) =====================
+// ===================== VERIFIED RVAs (FF THUONG - HEADLOCK V7) =====================
 static constexpr uintptr_t OFF_CAMERA_GET_MAIN   = 0x9F8FD00;
 static constexpr uintptr_t OFF_CAMERA_W2S        = 0x9F8F984;
 static constexpr uintptr_t OFF_COMP_GET_TF       = 0x9FD75D0;
@@ -27,11 +28,10 @@ static constexpr uintptr_t OFF_PLAYER_GET_HEAD2  = 0x6F2F4B8;
 static constexpr uintptr_t OFF_PLAYER_SET_AIM    = 0x6F2C794;
 static constexpr uintptr_t OFF_PLAYER_IS_FIRING  = 0x6F18750;
 static constexpr uintptr_t OFF_PLAYER_IS_WHOLE   = 0x6FD7274;
+static constexpr uintptr_t OFF_PLAYER_HOLD_FIRE  = 0x6F70C64;
 
 static constexpr uintptr_t OFF_PLAYER_ONUPDATE   = 0x6F4F9B0; // COW.GamePlay.Player::OnUpdate(float, float)
 static constexpr uintptr_t OFF_FOLLOWCAM_UPDATE  = 0x718FB60; // COW.GamePlay.FollowCamera::PFOGMCJCIDH()
-
-static void* g_il2cpp_handle = nullptr;
 
 #if defined(__aarch64__)
 
@@ -42,13 +42,18 @@ struct AimConfig {
     int   enable     = 1;        // 1 = bat, 0 = tat
     int   mode       = 1;        // 1 = CHI GHIM DAU KHI DANG BAN, 0 = luon ghim khi thay dich
     float fov        = 9999.0f;  // 9999 = toan man hinh
-    float head_y     = 0.03f;    // tinh chinh cao/thap tam dau
+    float head_y     = 0.00f;    // 0.00 = chinh giua tam xuong dau
     int   force_flag = 0;        // tham so bool thu 2 cua SetAimRotation (0 hoac 1)
 };
 
 struct EnemySlot {
     void*    ptr;
     uint64_t lastTick;
+};
+
+struct MemRange {
+    uintptr_t start;
+    uintptr_t end;
 };
 
 static AimConfig g_cfg;
@@ -59,37 +64,9 @@ static uint64_t  g_ply_tick    = 0;
 static uint64_t  g_cam_tick    = 0;
 static uint64_t  g_hb_tick     = 0;
 static EnemySlot g_seen[96]    = {};
+static uintptr_t g_patched[64] = {};
+static int       g_patched_cnt = 0;
 
-// IL2CPP C API (dung dlsym chuan nhu ban Perfare goc)
-using FnDomainGet      = void*       (*)();
-using FnGetAsms        = void**      (*)(void*, size_t*);
-using FnAsmGetImg      = void*       (*)(void*);
-using FnImgClassCount  = size_t      (*)(void*);
-using FnImgGetClass    = void*       (*)(void*, size_t);
-using FnClsGetName     = const char* (*)(void*);
-using FnClsGetNs       = const char* (*)(void*);
-using FnClsGetMethods  = void*       (*)(void*, void**);
-using FnClsAssignable  = bool        (*)(void*, void*);
-using FnMtdGetName     = const char* (*)(void*);
-using FnMtdParamCount  = uint32_t    (*)(void*);
-using FnIsVmThread     = bool        (*)(void*);
-using FnThreadAttach   = void*       (*)(void*);
-
-static FnDomainGet     api_domain_get             = nullptr;
-static FnGetAsms       api_domain_get_assemblies  = nullptr;
-static FnAsmGetImg     api_assembly_get_image     = nullptr;
-static FnImgClassCount api_image_get_class_count  = nullptr;
-static FnImgGetClass   api_image_get_class        = nullptr;
-static FnClsGetName    api_class_get_name         = nullptr;
-static FnClsGetNs      api_class_get_namespace    = nullptr;
-static FnClsGetMethods api_class_get_methods      = nullptr;
-static FnClsAssignable api_class_is_assignable    = nullptr;
-static FnMtdGetName    api_method_get_name        = nullptr;
-static FnMtdParamCount api_method_get_param_count = nullptr;
-static FnIsVmThread    api_is_vm_thread           = nullptr;
-static FnThreadAttach  api_thread_attach          = nullptr;
-
-// Game RVA function pointers
 using FnVoidVoid     = void*   (*)(const void*);
 using FnVoidPtr      = void*   (*)(void*, const void*);
 using FnBoolPtr      = bool    (*)(void*, const void*);
@@ -116,27 +93,78 @@ static FnVoidPtr      fn_GetHeadBone     = nullptr;
 static FnSetAim       fn_SetAimRotation  = nullptr;
 static FnBoolPtr      fn_IsFiring        = nullptr;
 static FnBoolPtr      fn_IsWholeFiring   = nullptr;
+static FnBoolPtr      fn_IsHoldFire      = nullptr;
 
-static FnPlayerUpdate orig_Player_OnUpdate   = nullptr;
-static FnCamUpdate    orig_FollowCam_Update  = nullptr;
+static FnPlayerUpdate orig_Player_OnUpdate  = nullptr;
+static FnCamUpdate    orig_FollowCam_Update = nullptr;
 
 static inline bool IsValidPtr(const void* p) {
     uintptr_t a = reinterpret_cast<uintptr_t>(p);
     return a > 0x100000000ULL && a < 0x7FFFFFFFFFULL && (a & 0x3ULL) == 0;
 }
 
-static bool SafeReadPtr(const void* addr, void** outVal) {
+static bool SafeReadPipe(int pfd[2], uintptr_t addr, void* dst, size_t len) {
+    ssize_t w = write(pfd[1], reinterpret_cast<const void*>(addr), len);
+    if (w <= 0) return false;
+    uint8_t* out = reinterpret_cast<uint8_t*>(dst);
+    size_t need = static_cast<size_t>(w);
+    size_t got = 0;
+    while (got < need) {
+        ssize_t r = read(pfd[0], out + got, need - got);
+        if (r <= 0) return false;
+        got += static_cast<size_t>(r);
+    }
+    return (need == len);
+}
+
+static bool SafeReadOnce(uintptr_t addr, void* dst, size_t len) {
     int pfd[2];
     if (pipe(pfd) != 0) return false;
-    bool ok = false;
-    if (write(pfd[1], addr, sizeof(void*)) == static_cast<ssize_t>(sizeof(void*))) {
-        if (read(pfd[0], outVal, sizeof(void*)) == static_cast<ssize_t>(sizeof(void*))) {
-            ok = true;
-        }
-    }
+    bool ok = SafeReadPipe(pfd, addr, dst, len);
     close(pfd[0]);
     close(pfd[1]);
     return ok;
+}
+
+static bool VerifyElfMagic(uintptr_t addr) {
+    if (!addr || (addr & 0xFFFULL) != 0) return false;
+    uint8_t hdr[4] = {};
+    return SafeReadOnce(addr, hdr, 4) && hdr[0] == 0x7F && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
+}
+
+static int FindIl2CppPhdrCb(struct dl_phdr_info* info, size_t, void* data) {
+    if (info && info->dlpi_name && strstr(info->dlpi_name, "libil2cpp.so")) {
+        uintptr_t cand = static_cast<uintptr_t>(info->dlpi_addr);
+        if (VerifyElfMagic(cand)) {
+            *reinterpret_cast<uintptr_t*>(data) = cand;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uintptr_t FindIl2CppBaseSafe() {
+    uintptr_t base = 0;
+    dl_iterate_phdr(FindIl2CppPhdrCb, &base);
+    if (base) return base;
+
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+    char line[512];
+    uintptr_t best = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strstr(line, "libil2cpp.so")) continue;
+        uintptr_t s = 0, e = 0;
+        if (sscanf(line, "%lx-%lx", &s, &e) == 2) {
+            if (VerifyElfMagic(s)) {
+                best = s;
+                break;
+            }
+            if (best == 0 || s < best) best = s;
+        }
+    }
+    fclose(fp);
+    return best;
 }
 
 static Quaternion QuatLookRotation(Vector3 fwd) {
@@ -225,7 +253,7 @@ static void RecordSeenPlayer(void* p) {
     g_seen[dst].lastTick = g_ply_tick;
 }
 
-static bool DetectPlayersDict(void* match, void* localPlayer) {
+static bool DetectPlayersDictSafe(void* match, void* localPlayer) {
     static const uintptr_t kDictOffsets[] = {
         0x118, 0x120, 0x128, 0x130, 0x138, 0x140, 0x148, 0x150,
         0x98,  0xB8,  0x168, 0x170, 0x178, 0x180, 0x188, 0x190,
@@ -233,15 +261,23 @@ static bool DetectPlayersDict(void* match, void* localPlayer) {
     };
     static const uintptr_t kStrides[] = { 0x28, 0x20, 0x18 };
 
+    int pfd[2];
+    if (pipe(pfd) != 0) return false;
+    bool found = false;
+
     for (uintptr_t off : kDictOffsets) {
-        void* dict = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(match) + off);
+        void* dict = nullptr;
+        if (!SafeReadPipe(pfd, reinterpret_cast<uintptr_t>(match) + off, &dict, sizeof(void*))) continue;
         if (!IsValidPtr(dict)) continue;
 
-        void* entries = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(dict) + 0x18);
-        int32_t count = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(dict) + 0x20);
+        void* entries = nullptr;
+        int32_t count = 0;
+        if (!SafeReadPipe(pfd, reinterpret_cast<uintptr_t>(dict) + 0x18, &entries, sizeof(void*))) continue;
+        if (!SafeReadPipe(pfd, reinterpret_cast<uintptr_t>(dict) + 0x20, &count, sizeof(int32_t))) continue;
         if (!IsValidPtr(entries) || count <= 0 || count > 128) continue;
 
-        uintptr_t maxLen = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(entries) + 0x18);
+        uintptr_t maxLen = 0;
+        if (!SafeReadPipe(pfd, reinterpret_cast<uintptr_t>(entries) + 0x18, &maxLen, sizeof(uintptr_t))) continue;
         if (maxLen < static_cast<uintptr_t>(count) || maxLen > 512) continue;
 
         uintptr_t arrBase = reinterpret_cast<uintptr_t>(entries) + 0x20;
@@ -251,19 +287,27 @@ static bool DetectPlayersDict(void* match, void* localPlayer) {
             uintptr_t valOff = stride - 8;
             for (int i = 0; i < lim; ++i) {
                 uintptr_t eAddr = arrBase + static_cast<uintptr_t>(i) * stride;
-                if (*reinterpret_cast<int32_t*>(eAddr) < 0) continue;
-                void* val = *reinterpret_cast<void**>(eAddr + valOff);
+                int32_t hash = -1;
+                void* val = nullptr;
+                if (!SafeReadPipe(pfd, eAddr, &hash, sizeof(int32_t)) || hash < 0) continue;
+                if (!SafeReadPipe(pfd, eAddr + valOff, &val, sizeof(void*))) continue;
                 if (val == localPlayer) {
                     g_dict_off    = off;
                     g_dict_stride = stride;
                     LOGI("[FFAim] DICT OK: off=0x%lx stride=0x%lx count=%d",
                          (unsigned long)off, (unsigned long)stride, count);
-                    return true;
+                    found = true;
+                    break;
                 }
             }
+            if (found) break;
         }
+        if (found) break;
     }
-    return false;
+
+    close(pfd[0]);
+    close(pfd[1]);
+    return found;
 }
 
 static void EvaluateHeadTarget(
@@ -309,6 +353,7 @@ static void RunHeadLock() {
     bool isShooting = false;
     if (fn_IsFiring && fn_IsFiring(localPlayer, nullptr)) isShooting = true;
     else if (fn_IsWholeFiring && fn_IsWholeFiring(localPlayer, nullptr)) isShooting = true;
+    else if (fn_IsHoldFire && fn_IsHoldFire(localPlayer, nullptr)) isShooting = true;
 
     void* cam = fn_Camera_get_main(nullptr);
     if (!IsValidPtr(cam)) return;
@@ -327,9 +372,10 @@ static void RunHeadLock() {
     float   bestDist   = g_cfg.fov;
     int     aliveCount = 0;
 
+    // Nguon 1: Danh sach Match Dictionary
     void* match = fn_CurrentMatch(nullptr);
     if (IsValidPtr(match)) {
-        if (g_dict_off == 0) DetectPlayersDict(match, localPlayer);
+        if (g_dict_off == 0 && (g_hb_tick % 60) == 1) DetectPlayersDictSafe(match, localPlayer);
         if (g_dict_off != 0) {
             void* dict = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(match) + g_dict_off);
             if (IsValidPtr(dict)) {
@@ -354,6 +400,7 @@ static void RunHeadLock() {
         }
     }
 
+    // Nguon 2: Danh sach Player thu thap truc tiep tu OnUpdate
     if (aliveCount == 0) {
         for (int i = 0; i < 96; ++i) {
             if (!g_seen[i].ptr) continue;
@@ -396,186 +443,163 @@ static void Hook_FollowCam_Update(void* instance, const void* method) {
     if (orig_FollowCam_Update) orig_FollowCam_Update(instance, method);
 }
 
-static void* FindMethodByName(void* klass, const char* methodName, uint32_t paramCount) {
-    void* iter = nullptr;
-    void* m = nullptr;
-    while ((m = api_class_get_methods(klass, &iter)) != nullptr) {
-        const char* mn = api_method_get_name(m);
-        if (mn && strcmp(mn, methodName) == 0) {
-            if (!api_method_get_param_count || api_method_get_param_count(m) == paramCount) {
-                return m;
-            }
-        }
-    }
-    return nullptr;
-}
-
-static bool PatchClassVTableSafe(
-    void* klass, void* methodInfo, uintptr_t expectedRva,
-    void* hookFn, void** outOrig, const char* label)
-{
-    if (!klass || !methodInfo) return false;
-    // Ep IL2CPP nap VTable sach (khong chay .cctor)
-    if (api_class_is_assignable) api_class_is_assignable(klass, klass);
-
-    void* expectedPtr = reinterpret_cast<void*>(g_base + expectedRva);
-    void* slot0 = nullptr;
-    void* slot1 = nullptr;
-    SafeReadPtr(methodInfo, &slot0);
-    SafeReadPtr(reinterpret_cast<uint8_t*>(methodInfo) + sizeof(void*), &slot1);
-
-    void** raw = reinterpret_cast<void**>(klass);
-    bool patched = false;
-    for (int i = 20; i < 1200; ++i) {
-        void* v0 = nullptr;
-        void* v1 = nullptr;
-        if (!SafeReadPtr(&raw[i], &v0) || !SafeReadPtr(&raw[i + 1], &v1)) break;
-        if (v1 == methodInfo && (v0 == expectedPtr || (IsValidPtr(slot0) && v0 == slot0) || (IsValidPtr(slot1) && v0 == slot1))) {
-            if (*outOrig == nullptr) *outOrig = v0;
-            raw[i] = hookFn;
-            patched = true;
-            LOGI("[FFAim] VTABLE HOOK OK: %s (slot=%d)", label, i);
-            break;
-        }
-    }
-
-    if (slot0 == expectedPtr) {
-        if (*outOrig == nullptr) *outOrig = slot0;
-        reinterpret_cast<void**>(methodInfo)[0] = hookFn;
-    }
-    return patched;
-}
-
-static bool InstallAllHooks() {
-    if (!api_domain_get || !api_domain_get_assemblies || !api_assembly_get_image ||
-        !api_image_get_class_count || !api_image_get_class ||
-        !api_class_get_name || !api_class_get_namespace ||
-        !api_class_get_methods || !api_method_get_name) {
-        LOGE("[FFAim] Thieu IL2CPP API!");
-        return false;
-    }
-
-    void* domain = api_domain_get();
-    if (!domain) return false;
-    if (api_thread_attach) api_thread_attach(domain);
-
-    size_t asmCount = 0;
-    void** asms = api_domain_get_assemblies(domain, &asmCount);
-    if (!asms || asmCount == 0) return false;
-
-    static bool okPlayer = false;
-    static bool okCam    = false;
-
-    for (size_t i = 0; i < asmCount; ++i) {
-        void* img = api_assembly_get_image(asms[i]);
-        if (!img) continue;
-        size_t clsCount = api_image_get_class_count(img);
-        for (size_t c = 0; c < clsCount; ++c) {
-            void* klass = api_image_get_class(img, c);
-            if (!klass) continue;
-            const char* ns = api_class_get_namespace(klass);
-            if (!ns || strcmp(ns, "COW.GamePlay") != 0) continue;
-            const char* nm = api_class_get_name(klass);
-            if (!nm) continue;
-
-            if (!okPlayer && strcmp(nm, "Player") == 0) {
-                void* mUpd = FindMethodByName(klass, "OnUpdate", 2);
-                okPlayer = PatchClassVTableSafe(klass, mUpd, OFF_PLAYER_ONUPDATE,
-                                                reinterpret_cast<void*>(&Hook_Player_OnUpdate),
-                                                reinterpret_cast<void**>(&orig_Player_OnUpdate),
-                                                "COW.GamePlay.Player::OnUpdate");
-            } else if (!okCam && strcmp(nm, "FollowCamera") == 0) {
-                void* mCam = FindMethodByName(klass, "PFOGMCJCIDH", 0);
-                okCam = PatchClassVTableSafe(klass, mCam, OFF_FOLLOWCAM_UPDATE,
-                                             reinterpret_cast<void*>(&Hook_FollowCam_Update),
-                                             reinterpret_cast<void**>(&orig_FollowCam_Update),
-                                             "COW.GamePlay.FollowCamera::PFOGMCJCIDH");
-            }
-            if (okPlayer && okCam) break;
-        }
-        if (okPlayer && okCam) break;
-    }
-
-    if (okPlayer || okCam) {
-        LOGI("[FFAim] HOOK THANH CONG (HEADLOCK V6) | Player=%d | FollowCam=%d",
-             okPlayer ? 1 : 0, okCam ? 1 : 0);
-        return (okPlayer && okCam);
+static bool AlreadyPatched(uintptr_t addr) {
+    for (int i = 0; i < g_patched_cnt; ++i) {
+        if (g_patched[i] == addr) return true;
     }
     return false;
+}
+
+static void MarkPatched(uintptr_t addr) {
+    if (g_patched_cnt < 64) g_patched[g_patched_cnt++] = addr;
+}
+
+static bool InRwRanges(const std::vector<MemRange>& ranges, uintptr_t p) {
+    for (const auto& r : ranges) {
+        if (p >= r.start && p + 16 <= r.end) return true;
+    }
+    return false;
+}
+
+static void ScanAndPatchVTables(bool& hookedPlayer, bool& hookedCam) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return;
+
+    std::vector<MemRange> ranges;
+    ranges.reserve(256);
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        uintptr_t s = 0, e = 0;
+        char perms[8] = {};
+        char path[256] = {};
+        int n = sscanf(line, "%lx-%lx %7s %*s %*s %*s %255[^\n]", &s, &e, perms, path);
+        if (n < 3) continue;
+        if (perms[0] != 'r' || perms[1] != 'w' || perms[3] != 'p') continue;
+        if (e <= s || (e - s) > 256ULL * 1024ULL * 1024ULL) continue;
+
+        // Chi quet vung heap an danh (noi IL2CPP cap phat Il2CppClass & MethodInfo)
+        const char* p = path;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p != '\0' && *p != '[') continue;
+        if (strstr(p, "dalvik") || strstr(p, "stack") || strstr(p, "kgsl") || strstr(p, "ashmem")) continue;
+
+        ranges.push_back({s, e});
+    }
+    fclose(fp);
+
+    int pfd[2];
+    if (pipe(pfd) != 0) return;
+
+    const uintptr_t targetPlayer = g_base + OFF_PLAYER_ONUPDATE;
+    const uintptr_t targetCam    = g_base + OFF_FOLLOWCAM_UPDATE;
+    uint8_t page[4096];
+
+    for (const auto& r : ranges) {
+        for (uintptr_t addr = r.start; addr + 4096 <= r.end; addr += 4096) {
+            if (!SafeReadPipe(pfd, addr, page, 4096)) continue;
+
+            const uintptr_t* q = reinterpret_cast<const uintptr_t*>(page);
+            for (size_t idx = 0; idx < 512; ++idx) {
+                uintptr_t val = q[idx];
+                if (val != targetPlayer && val != targetCam) continue;
+
+                uintptr_t slotAddr = addr + idx * 8;
+                if (AlreadyPatched(slotAddr)) continue;
+
+                uintptr_t miAddr = 0;
+                if (idx + 1 < 512) {
+                    miAddr = q[idx + 1];
+                } else {
+                    if (!SafeReadPipe(pfd, slotAddr + 8, &miAddr, 8)) continue;
+                }
+
+                if (miAddr == slotAddr || (miAddr & 0x7ULL) != 0) continue;
+                if (!InRwRanges(ranges, miAddr)) continue;
+
+                uintptr_t miHead[2] = {};
+                if (!SafeReadPipe(pfd, miAddr, miHead, 16)) continue;
+                if (miHead[0] != val && miHead[1] != val) continue;
+
+                if (val == targetPlayer) {
+                    *reinterpret_cast<void**>(slotAddr) = reinterpret_cast<void*>(&Hook_Player_OnUpdate);
+                    MarkPatched(slotAddr);
+                    hookedPlayer = true;
+                    LOGI("[FFAim] VTABLE HOOK OK: Player::OnUpdate @ 0x%lx", (unsigned long)slotAddr);
+                } else {
+                    *reinterpret_cast<void**>(slotAddr) = reinterpret_cast<void*>(&Hook_FollowCam_Update);
+                    MarkPatched(slotAddr);
+                    hookedCam = true;
+                    LOGI("[FFAim] VTABLE HOOK OK: FollowCamera::PFOGMCJCIDH @ 0x%lx", (unsigned long)slotAddr);
+                }
+            }
+        }
+    }
+
+    close(pfd[0]);
+    close(pfd[1]);
 }
 
 #endif
 
 void il2cpp_api_init(void *handle) {
-    g_il2cpp_handle = handle;
+    (void)handle;
 #if defined(__aarch64__)
-    LOGI("[FFAim] HEADLOCK V6 il2cpp_handle: %p", handle);
-    api_domain_get             = reinterpret_cast<FnDomainGet>(dlsym(handle, "il2cpp_domain_get"));
-    api_domain_get_assemblies  = reinterpret_cast<FnGetAsms>(dlsym(handle, "il2cpp_domain_get_assemblies"));
-    api_assembly_get_image     = reinterpret_cast<FnAsmGetImg>(dlsym(handle, "il2cpp_assembly_get_image"));
-    api_image_get_class_count  = reinterpret_cast<FnImgClassCount>(dlsym(handle, "il2cpp_image_get_class_count"));
-    api_image_get_class        = reinterpret_cast<FnImgGetClass>(dlsym(handle, "il2cpp_image_get_class"));
-    api_class_get_name         = reinterpret_cast<FnClsGetName>(dlsym(handle, "il2cpp_class_get_name"));
-    api_class_get_namespace    = reinterpret_cast<FnClsGetNs>(dlsym(handle, "il2cpp_class_get_namespace"));
-    api_class_get_methods      = reinterpret_cast<FnClsGetMethods>(dlsym(handle, "il2cpp_class_get_methods"));
-    api_class_is_assignable    = reinterpret_cast<FnClsAssignable>(dlsym(handle, "il2cpp_class_is_assignable_from"));
-    api_method_get_name        = reinterpret_cast<FnMtdGetName>(dlsym(handle, "il2cpp_method_get_name"));
-    api_method_get_param_count = reinterpret_cast<FnMtdParamCount>(dlsym(handle, "il2cpp_method_get_param_count"));
-    api_is_vm_thread           = reinterpret_cast<FnIsVmThread>(dlsym(handle, "il2cpp_is_vm_thread"));
-    api_thread_attach          = reinterpret_cast<FnThreadAttach>(dlsym(handle, "il2cpp_thread_attach"));
-
-    if (api_domain_get_assemblies) {
-        Dl_info dlInfo{};
-        if (dladdr(reinterpret_cast<void*>(api_domain_get_assemblies), &dlInfo) && dlInfo.dli_fbase) {
-            g_base = reinterpret_cast<uintptr_t>(dlInfo.dli_fbase);
-        }
-        LOGI("[FFAim] HEADLOCK V6 il2cpp_base: 0x%lx", (unsigned long)g_base);
-    } else {
-        LOGE("[FFAim] dlsym il2cpp_domain_get_assemblies that bai!");
-        return;
-    }
-
-    if (api_is_vm_thread) {
-        for (int w = 0; w < 60; ++w) {
-            if (api_is_vm_thread(nullptr)) break;
-            LOGI("[FFAim] Waiting for il2cpp_init...");
-            sleep(1);
-        }
-    }
+    g_base = FindIl2CppBaseSafe();
+    LOGI("[FFAim] HEADLOCK V7 libil2cpp_base = 0x%lx", (unsigned long)g_base);
 #endif
 }
 
 void il2cpp_dump(const char *outDir) {
     (void)outDir;
 #if defined(__aarch64__)
+    for (int w = 0; w < 30 && g_base == 0; ++w) {
+        sleep(1);
+        g_base = FindIl2CppBaseSafe();
+    }
     if (!g_base) {
-        LOGE("[FFAim] il2cpp_base = 0, huy cai hook!");
+        LOGE("[FFAim] HEADLOCK V7 khong tim thay base libil2cpp.so!");
         return;
     }
 
-    fn_Camera_get_main = reinterpret_cast<FnVoidVoid>(g_base + OFF_CAMERA_GET_MAIN);
-    fn_Camera_W2S      = reinterpret_cast<FnW2S>(g_base + OFF_CAMERA_W2S);
-    fn_Comp_get_tf     = reinterpret_cast<FnVoidPtr>(g_base + OFF_COMP_GET_TF);
-    fn_Tf_get_pos      = reinterpret_cast<FnVec3Ptr>(g_base + OFF_TF_GET_POS);
-    fn_Screen_W        = reinterpret_cast<FnIntVoid>(g_base + OFF_SCREEN_GET_W);
-    fn_Screen_H        = reinterpret_cast<FnIntVoid>(g_base + OFF_SCREEN_GET_H);
+    fn_Camera_get_main    = reinterpret_cast<FnVoidVoid>(g_base + OFF_CAMERA_GET_MAIN);
+    fn_Camera_W2S         = reinterpret_cast<FnW2S>(g_base + OFF_CAMERA_W2S);
+    fn_Comp_get_tf        = reinterpret_cast<FnVoidPtr>(g_base + OFF_COMP_GET_TF);
+    fn_Tf_get_pos         = reinterpret_cast<FnVec3Ptr>(g_base + OFF_TF_GET_POS);
+    fn_Screen_W           = reinterpret_cast<FnIntVoid>(g_base + OFF_SCREEN_GET_W);
+    fn_Screen_H           = reinterpret_cast<FnIntVoid>(g_base + OFF_SCREEN_GET_H);
 
-    fn_CurrentMatch    = reinterpret_cast<FnVoidVoid>(g_base + OFF_CURRENT_MATCH);
-    fn_LocalPlayer     = reinterpret_cast<FnVoidVoid>(g_base + OFF_LOCAL_PLAYER);
-    fn_IsTeammate      = reinterpret_cast<FnBoolPtr>(g_base + OFF_IS_TEAMMATE);
+    fn_CurrentMatch       = reinterpret_cast<FnVoidVoid>(g_base + OFF_CURRENT_MATCH);
+    fn_LocalPlayer        = reinterpret_cast<FnVoidVoid>(g_base + OFF_LOCAL_PLAYER);
+    fn_IsTeammate         = reinterpret_cast<FnBoolPtr>(g_base + OFF_IS_TEAMMATE);
 
-    fn_IsDieing        = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_IS_DIEING);
-    fn_IsDead          = reinterpret_cast<FnBoolPtr>(g_base + OFF_ENTITY_IS_DEAD);
-    fn_GetHeadTF       = reinterpret_cast<FnVoidPtr>(g_base + OFF_PLAYER_GET_HEAD);
-    fn_GetHeadBone     = reinterpret_cast<FnVoidPtr>(g_base + OFF_PLAYER_GET_HEAD2);
-    fn_SetAimRotation  = reinterpret_cast<FnSetAim>(g_base + OFF_PLAYER_SET_AIM);
-    fn_IsFiring        = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_IS_FIRING);
-    fn_IsWholeFiring   = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_IS_WHOLE);
+    fn_IsDieing           = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_IS_DIEING);
+    fn_IsDead             = reinterpret_cast<FnBoolPtr>(g_base + OFF_ENTITY_IS_DEAD);
+    fn_GetHeadTF          = reinterpret_cast<FnVoidPtr>(g_base + OFF_PLAYER_GET_HEAD);
+    fn_GetHeadBone        = reinterpret_cast<FnVoidPtr>(g_base + OFF_PLAYER_GET_HEAD2);
+    fn_SetAimRotation     = reinterpret_cast<FnSetAim>(g_base + OFF_PLAYER_SET_AIM);
+    fn_IsFiring           = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_IS_FIRING);
+    fn_IsWholeFiring      = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_IS_WHOLE);
+    fn_IsHoldFire         = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_HOLD_FIRE);
+
+    orig_Player_OnUpdate  = reinterpret_cast<FnPlayerUpdate>(g_base + OFF_PLAYER_ONUPDATE);
+    orig_FollowCam_Update = reinterpret_cast<FnCamUpdate>(g_base + OFF_FOLLOWCAM_UPDATE);
 
     ReloadConfig();
-    for (int retry = 0; retry < 30; ++retry) {
-        if (InstallAllHooks()) break;
-        sleep(2);
+    LOGI("[FFAim] HEADLOCK V7 SAN SANG (base=0x%lx) - Cho vao tran de gan VTable...", (unsigned long)g_base);
+
+    bool hookedPlayer = false;
+    bool hookedCam    = false;
+    bool announced    = false;
+
+    // Quet lien tuc trong nen (khong dung dlsym/xdl_sym) de tu dong bat VTable ngay khi vao sanh/tran
+    for (int pass = 0; pass < 600; ++pass) {
+        ScanAndPatchVTables(hookedPlayer, hookedCam);
+        if ((hookedPlayer || hookedCam) && !announced) {
+            announced = true;
+            LOGI("[FFAim] HOOK THANH CONG (HEADLOCK V7) | Player=%d | FollowCam=%d",
+                 hookedPlayer ? 1 : 0, hookedCam ? 1 : 0);
+        }
+        sleep((hookedPlayer && hookedCam) ? 10 : 2);
     }
 #endif
 }
