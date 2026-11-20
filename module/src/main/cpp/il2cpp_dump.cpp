@@ -1,429 +1,305 @@
-//
-// Created by Perfare on 2020/7/4.
-//
-
 #include "il2cpp_dump.h"
-#include <dlfcn.h>
+#include "log.h"
+#include "xdl.h"
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cinttypes>
-#include <string>
-#include <vector>
-#include <sstream>
-#include <fstream>
+#include <cmath>
 #include <unistd.h>
-#include "xdl.h"
-#include "log.h"
-#include "il2cpp-tabledefs.h"
-#include "il2cpp-class.h"
+#include <sys/mman.h>
 
-#define DO_API(r, n, p) r (*n) p
+// ===================== AUTO-FILLED VERIFIED OFFSETS (FF THUONG) =====================
+static constexpr uintptr_t OFF_CAMERA_GET_MAIN   = 0x9F8FD00;
+static constexpr uintptr_t OFF_CAMERA_W2S        = 0x9F8F984;
+static constexpr uintptr_t OFF_COMP_GET_TF       = 0x9FD75D0;
+static constexpr uintptr_t OFF_TF_GET_POS        = 0x9FE5A68;
+static constexpr uintptr_t OFF_TF_GET_ROT        = 0x9FE5C58;
+static constexpr uintptr_t OFF_QUAT_LOOKROT      = 0x9FCD630;
+static constexpr uintptr_t OFF_QUAT_SLERP        = 0x9FCD064;
+static constexpr uintptr_t OFF_SCREEN_GET_W      = 0x9F9D1D4;
+static constexpr uintptr_t OFF_SCREEN_GET_H      = 0x9F9D1FC;
 
-#include "il2cpp-api-functions.h"
+static constexpr uintptr_t OFF_CURRENT_MATCH     = 0x71BCD10;
+static constexpr uintptr_t OFF_IS_TEAMMATE       = 0x71BD8EC;
+static constexpr uintptr_t OFF_PLAYER_IS_DIEING  = 0x6F157C0;
+static constexpr uintptr_t OFF_PLAYER_SET_AIM    = 0x6F2C794;
+static constexpr uintptr_t OFF_PLAYER_GET_HEAD   = 0x6FAE37C;
+static constexpr uintptr_t OFF_PLAYER_GET_HIP    = 0x6FAE508;
+static constexpr uintptr_t OFF_ENTITY_IS_DEAD    = 0x716CC10;
 
-#undef DO_API
+static constexpr uintptr_t OFF_MATCH_LOCAL       = 0xD8;
+static constexpr uintptr_t OFF_MATCH_DICT        = 0x0;
+static constexpr uintptr_t OFF_HOOK_RVA          = 0x6F82148;
+static constexpr const char* HOOK_NS             = "COW.GamePlay";
+static constexpr const char* HOOK_CLASS          = "Player";
+static constexpr const char* HOOK_METHOD         = "LateUpdate";
 
-static uint64_t il2cpp_base = 0;
+static void* g_il2cpp_handle = nullptr;
 
-void init_il2cpp_api(void *handle) {
-#define DO_API(r, n, p) {                      \
-    n = (r (*) p)xdl_sym(handle, #n, nullptr); \
-    if(!n) {                                   \
-        LOGW("api not found %s", #n);          \
-    }                                          \
+#if defined(__aarch64__)
+
+struct Vector3 { float x, y, z; };
+struct Quaternion { float x, y, z, w; };
+
+struct AimConfig {
+    int   enable = 1;       // 1 = bat, 0 = tat
+    float fov    = 180.0f;  // ban kinh FOV tinh theo pixel tu tam man hinh
+    float smooth = 0.35f;   // 0.1 = muot cham, 1.0 = ghim cung tuc thi
+    int   bone   = 0;       // 0 = Head, 1 = Hip
+};
+
+static AimConfig g_cfg;
+static uintptr_t g_base = 0;
+static uint64_t  g_frame = 0;
+
+using FnVoidVoid     = void* (*)(const void*);
+using FnVoidPtr      = void* (*)(void*, const void*);
+using FnBoolPtr      = bool  (*)(void*, const void*);
+using FnIntVoid      = int   (*)(const void*);
+using FnVec3Ptr      = Vector3 (*)(void*, const void*);
+using FnQuatPtr      = Quaternion (*)(void*, const void*);
+using FnW2S          = Vector3 (*)(void*, Vector3, const void*);
+using FnLookRot      = Quaternion (*)(Vector3, const void*);
+using FnSlerp        = Quaternion (*)(Quaternion, Quaternion, float, const void*);
+using FnSetAim       = void (*)(void*, Quaternion, bool, const void*);
+using FnUpdateHook   = void (*)(void*, const void*);
+
+static FnVoidVoid   fn_Camera_get_main   = nullptr;
+static FnW2S        fn_Camera_W2S        = nullptr;
+static FnVoidPtr    fn_Comp_get_tf       = nullptr;
+static FnVec3Ptr    fn_Tf_get_pos        = nullptr;
+static FnQuatPtr    fn_Tf_get_rot        = nullptr;
+static FnLookRot    fn_Quat_LookRot      = nullptr;
+static FnSlerp      fn_Quat_Slerp        = nullptr;
+static FnIntVoid    fn_Screen_W          = nullptr;
+static FnIntVoid    fn_Screen_H          = nullptr;
+static FnVoidVoid   fn_CurrentMatch      = nullptr;
+static FnBoolPtr    fn_IsTeammate        = nullptr;
+static FnBoolPtr    fn_IsDieing          = nullptr;
+static FnBoolPtr    fn_IsDead            = nullptr;
+static FnVoidPtr    fn_GetHeadTF         = nullptr;
+static FnVoidPtr    fn_GetHipTF          = nullptr;
+static FnSetAim     fn_SetAimRotation    = nullptr;
+static FnUpdateHook orig_UpdateHook      = nullptr;
+
+static inline bool IsValidPtr(const void* p) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return a > 0x100000000ULL && a < 0x7FFFFFFFFFULL && (a & 0x3ULL) == 0;
 }
 
-#include "il2cpp-api-functions.h"
-
-#undef DO_API
-}
-
-std::string get_method_modifier(uint32_t flags) {
-    std::stringstream outPut;
-    auto access = flags & METHOD_ATTRIBUTE_MEMBER_ACCESS_MASK;
-    switch (access) {
-        case METHOD_ATTRIBUTE_PRIVATE:
-            outPut << "private ";
-            break;
-        case METHOD_ATTRIBUTE_PUBLIC:
-            outPut << "public ";
-            break;
-        case METHOD_ATTRIBUTE_FAMILY:
-            outPut << "protected ";
-            break;
-        case METHOD_ATTRIBUTE_ASSEM:
-        case METHOD_ATTRIBUTE_FAM_AND_ASSEM:
-            outPut << "internal ";
-            break;
-        case METHOD_ATTRIBUTE_FAM_OR_ASSEM:
-            outPut << "protected internal ";
-            break;
-    }
-    if (flags & METHOD_ATTRIBUTE_STATIC) {
-        outPut << "static ";
-    }
-    if (flags & METHOD_ATTRIBUTE_ABSTRACT) {
-        outPut << "abstract ";
-        if ((flags & METHOD_ATTRIBUTE_VTABLE_LAYOUT_MASK) == METHOD_ATTRIBUTE_REUSE_SLOT) {
-            outPut << "override ";
-        }
-    } else if (flags & METHOD_ATTRIBUTE_FINAL) {
-        if ((flags & METHOD_ATTRIBUTE_VTABLE_LAYOUT_MASK) == METHOD_ATTRIBUTE_REUSE_SLOT) {
-            outPut << "sealed override ";
-        }
-    } else if (flags & METHOD_ATTRIBUTE_VIRTUAL) {
-        if ((flags & METHOD_ATTRIBUTE_VTABLE_LAYOUT_MASK) == METHOD_ATTRIBUTE_NEW_SLOT) {
-            outPut << "virtual ";
-        } else {
-            outPut << "override ";
-        }
-    }
-    if (flags & METHOD_ATTRIBUTE_PINVOKE_IMPL) {
-        outPut << "extern ";
-    }
-    return outPut.str();
-}
-
-bool _il2cpp_type_is_byref(const Il2CppType *type) {
-    auto byref = type->byref;
-    if (il2cpp_type_is_byref) {
-        byref = il2cpp_type_is_byref(type);
-    }
-    return byref;
-}
-
-std::string dump_method(Il2CppClass *klass) {
-    std::stringstream outPut;
-    outPut << "\n\t// Methods\n";
-    void *iter = nullptr;
-    while (auto method = il2cpp_class_get_methods(klass, &iter)) {
-        //TODO attribute
-        if (method->methodPointer) {
-            outPut << "\t// RVA: 0x";
-            outPut << std::hex << (uint64_t) method->methodPointer - il2cpp_base;
-            outPut << " VA: 0x";
-            outPut << std::hex << (uint64_t) method->methodPointer;
-        } else {
-            outPut << "\t// RVA: 0x VA: 0x0";
-        }
-        /*if (method->slot != 65535) {
-            outPut << " Slot: " << std::dec << method->slot;
-        }*/
-        outPut << "\n\t";
-        uint32_t iflags = 0;
-        auto flags = il2cpp_method_get_flags(method, &iflags);
-        outPut << get_method_modifier(flags);
-        //TODO genericContainerIndex
-        auto return_type = il2cpp_method_get_return_type(method);
-        if (_il2cpp_type_is_byref(return_type)) {
-            outPut << "ref ";
-        }
-        auto return_class = il2cpp_class_from_type(return_type);
-        outPut << il2cpp_class_get_name(return_class) << " " << il2cpp_method_get_name(method)
-               << "(";
-        auto param_count = il2cpp_method_get_param_count(method);
-        for (int i = 0; i < param_count; ++i) {
-            auto param = il2cpp_method_get_param(method, i);
-            auto attrs = param->attrs;
-            if (_il2cpp_type_is_byref(param)) {
-                if (attrs & PARAM_ATTRIBUTE_OUT && !(attrs & PARAM_ATTRIBUTE_IN)) {
-                    outPut << "out ";
-                } else if (attrs & PARAM_ATTRIBUTE_IN && !(attrs & PARAM_ATTRIBUTE_OUT)) {
-                    outPut << "in ";
-                } else {
-                    outPut << "ref ";
-                }
-            } else {
-                if (attrs & PARAM_ATTRIBUTE_IN) {
-                    outPut << "[In] ";
-                }
-                if (attrs & PARAM_ATTRIBUTE_OUT) {
-                    outPut << "[Out] ";
-                }
-            }
-            auto parameter_class = il2cpp_class_from_type(param);
-            outPut << il2cpp_class_get_name(parameter_class) << " "
-                   << il2cpp_method_get_param_name(method, i);
-            outPut << ", ";
-        }
-        if (param_count > 0) {
-            outPut.seekp(-2, outPut.cur);
-        }
-        outPut << ") { }\n";
-        //TODO GenericInstMethod
-    }
-    return outPut.str();
-}
-
-std::string dump_property(Il2CppClass *klass) {
-    std::stringstream outPut;
-    outPut << "\n\t// Properties\n";
-    void *iter = nullptr;
-    while (auto prop_const = il2cpp_class_get_properties(klass, &iter)) {
-        //TODO attribute
-        auto prop = const_cast<PropertyInfo *>(prop_const);
-        auto get = il2cpp_property_get_get_method(prop);
-        auto set = il2cpp_property_get_set_method(prop);
-        auto prop_name = il2cpp_property_get_name(prop);
-        outPut << "\t";
-        Il2CppClass *prop_class = nullptr;
-        uint32_t iflags = 0;
-        if (get) {
-            outPut << get_method_modifier(il2cpp_method_get_flags(get, &iflags));
-            prop_class = il2cpp_class_from_type(il2cpp_method_get_return_type(get));
-        } else if (set) {
-            outPut << get_method_modifier(il2cpp_method_get_flags(set, &iflags));
-            auto param = il2cpp_method_get_param(set, 0);
-            prop_class = il2cpp_class_from_type(param);
-        }
-        if (prop_class) {
-            outPut << il2cpp_class_get_name(prop_class) << " " << prop_name << " { ";
-            if (get) {
-                outPut << "get; ";
-            }
-            if (set) {
-                outPut << "set; ";
-            }
-            outPut << "}\n";
-        } else {
-            if (prop_name) {
-                outPut << " // unknown property " << prop_name;
+static uintptr_t GetLibBase(const char* name) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+    char line[512];
+    uintptr_t best = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, name)) {
+            uintptr_t s = 0;
+            if (sscanf(line, "%lx-", &s) == 1) {
+                if (best == 0 || s < best) best = s;
             }
         }
     }
-    return outPut.str();
+    fclose(fp);
+    return best;
 }
 
-std::string dump_field(Il2CppClass *klass) {
-    std::stringstream outPut;
-    outPut << "\n\t// Fields\n";
-    auto is_enum = il2cpp_class_is_enum(klass);
-    void *iter = nullptr;
-    while (auto field = il2cpp_class_get_fields(klass, &iter)) {
-        //TODO attribute
-        outPut << "\t";
-        auto attrs = il2cpp_field_get_flags(field);
-        auto access = attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK;
-        switch (access) {
-            case FIELD_ATTRIBUTE_PRIVATE:
-                outPut << "private ";
-                break;
-            case FIELD_ATTRIBUTE_PUBLIC:
-                outPut << "public ";
-                break;
-            case FIELD_ATTRIBUTE_FAMILY:
-                outPut << "protected ";
-                break;
-            case FIELD_ATTRIBUTE_ASSEMBLY:
-            case FIELD_ATTRIBUTE_FAM_AND_ASSEM:
-                outPut << "internal ";
-                break;
-            case FIELD_ATTRIBUTE_FAM_OR_ASSEM:
-                outPut << "protected internal ";
-                break;
-        }
-        if (attrs & FIELD_ATTRIBUTE_LITERAL) {
-            outPut << "const ";
-        } else {
-            if (attrs & FIELD_ATTRIBUTE_STATIC) {
-                outPut << "static ";
-            }
-            if (attrs & FIELD_ATTRIBUTE_INIT_ONLY) {
-                outPut << "readonly ";
-            }
-        }
-        auto field_type = il2cpp_field_get_type(field);
-        auto field_class = il2cpp_class_from_type(field_type);
-        outPut << il2cpp_class_get_name(field_class) << " " << il2cpp_field_get_name(field);
-        //TODO 获取构造函数初始化后的字段值
-        if (attrs & FIELD_ATTRIBUTE_LITERAL && is_enum) {
-            uint64_t val = 0;
-            il2cpp_field_static_get_value(field, &val);
-            outPut << " = " << std::dec << val;
-        }
-        outPut << "; // 0x" << std::hex << il2cpp_field_get_offset(field) << "\n";
+static void ReloadConfig() {
+    FILE* fp = fopen("/data/local/tmp/ff_aim.cfg", "r");
+    if (!fp) return;
+    char buf[128];
+    while (fgets(buf, sizeof(buf), fp)) {
+        int iv = 0; float fv = 0.0f;
+        if (sscanf(buf, "enable=%d", &iv) == 1) g_cfg.enable = iv;
+        else if (sscanf(buf, "fov=%f", &fv) == 1) g_cfg.fov = fv;
+        else if (sscanf(buf, "smooth=%f", &fv) == 1) g_cfg.smooth = fv;
+        else if (sscanf(buf, "bone=%d", &iv) == 1) g_cfg.bone = iv;
     }
-    return outPut.str();
+    fclose(fp);
+    if (g_cfg.smooth < 0.05f) g_cfg.smooth = 0.05f;
+    if (g_cfg.smooth > 1.0f)  g_cfg.smooth = 1.0f;
 }
 
-std::string dump_type(const Il2CppType *type) {
-    std::stringstream outPut;
-    auto *klass = il2cpp_class_from_type(type);
-    outPut << "\n// Namespace: " << il2cpp_class_get_namespace(klass) << "\n";
-    auto flags = il2cpp_class_get_flags(klass);
-    if (flags & TYPE_ATTRIBUTE_SERIALIZABLE) {
-        outPut << "[Serializable]\n";
-    }
-    //TODO attribute
-    auto is_valuetype = il2cpp_class_is_valuetype(klass);
-    auto is_enum = il2cpp_class_is_enum(klass);
-    auto visibility = flags & TYPE_ATTRIBUTE_VISIBILITY_MASK;
-    switch (visibility) {
-        case TYPE_ATTRIBUTE_PUBLIC:
-        case TYPE_ATTRIBUTE_NESTED_PUBLIC:
-            outPut << "public ";
-            break;
-        case TYPE_ATTRIBUTE_NOT_PUBLIC:
-        case TYPE_ATTRIBUTE_NESTED_FAM_AND_ASSEM:
-        case TYPE_ATTRIBUTE_NESTED_ASSEMBLY:
-            outPut << "internal ";
-            break;
-        case TYPE_ATTRIBUTE_NESTED_PRIVATE:
-            outPut << "private ";
-            break;
-        case TYPE_ATTRIBUTE_NESTED_FAMILY:
-            outPut << "protected ";
-            break;
-        case TYPE_ATTRIBUTE_NESTED_FAM_OR_ASSEM:
-            outPut << "protected internal ";
-            break;
-    }
-    if (flags & TYPE_ATTRIBUTE_ABSTRACT && flags & TYPE_ATTRIBUTE_SEALED) {
-        outPut << "static ";
-    } else if (!(flags & TYPE_ATTRIBUTE_INTERFACE) && flags & TYPE_ATTRIBUTE_ABSTRACT) {
-        outPut << "abstract ";
-    } else if (!is_valuetype && !is_enum && flags & TYPE_ATTRIBUTE_SEALED) {
-        outPut << "sealed ";
-    }
-    if (flags & TYPE_ATTRIBUTE_INTERFACE) {
-        outPut << "interface ";
-    } else if (is_enum) {
-        outPut << "enum ";
-    } else if (is_valuetype) {
-        outPut << "struct ";
-    } else {
-        outPut << "class ";
-    }
-    outPut << il2cpp_class_get_name(klass); //TODO genericContainerIndex
-    std::vector<std::string> extends;
-    auto parent = il2cpp_class_get_parent(klass);
-    if (!is_valuetype && !is_enum && parent) {
-        auto parent_type = il2cpp_class_get_type(parent);
-        if (parent_type->type != IL2CPP_TYPE_OBJECT) {
-            extends.emplace_back(il2cpp_class_get_name(parent));
+static void RunAimbot(void* callerInstance) {
+    if ((++g_frame % 120) == 1) ReloadConfig();
+    if (!g_cfg.enable || OFF_MATCH_LOCAL == 0 || OFF_MATCH_DICT == 0) return;
+
+    void* match = fn_CurrentMatch(nullptr);
+    if (!IsValidPtr(match)) return;
+
+    void* localPlayer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(match) + OFF_MATCH_LOCAL);
+    if (!IsValidPtr(localPlayer)) return;
+
+    // Neu hook tren Player::LateUpdate, chi chay 1 lan/frame tren LocalPlayer
+    if (strcmp(HOOK_CLASS, "Player") == 0 && callerInstance != localPlayer) return;
+
+    if (fn_IsDead(localPlayer, nullptr) || fn_IsDieing(localPlayer, nullptr)) return;
+
+    void* cam = fn_Camera_get_main(nullptr);
+    if (!IsValidPtr(cam)) return;
+    void* camTf = fn_Comp_get_tf(cam, nullptr);
+    if (!IsValidPtr(camTf)) return;
+
+    Vector3 camPos = fn_Tf_get_pos(camTf, nullptr);
+    Quaternion camRot = fn_Tf_get_rot(camTf, nullptr);
+
+    float sw = (fn_Screen_W ? static_cast<float>(fn_Screen_W(nullptr)) : 1280.0f);
+    float sh = (fn_Screen_H ? static_cast<float>(fn_Screen_H(nullptr)) : 720.0f);
+    if (sw < 100.0f || sh < 100.0f) { sw = 1280.0f; sh = 720.0f; }
+    float cx = sw * 0.5f;
+    float cy = sh * 0.5f;
+
+    void* dict = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(match) + OFF_MATCH_DICT);
+    if (!IsValidPtr(dict)) return;
+
+    // IL2CPP Dictionary<K, Player> 64-bit: entries @ 0x18, count @ 0x20
+    void* entries = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(dict) + 0x18);
+    int32_t count = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(dict) + 0x20);
+    if (!IsValidPtr(entries) || count <= 0) return;
+    if (count > 128) count = 128;
+
+    uintptr_t arrBase = reinterpret_cast<uintptr_t>(entries) + 0x20;
+    void*   bestEnemy = nullptr;
+    Vector3 bestPos   = {0, 0, 0};
+    float   bestDist  = g_cfg.fov;
+
+    for (int32_t i = 0; i < count; ++i) {
+        uintptr_t entryAddr = arrBase + static_cast<uintptr_t>(i) * 0x18;
+        int32_t hashCode = *reinterpret_cast<int32_t*>(entryAddr);
+        if (hashCode < 0) continue;
+
+        void* enemy = *reinterpret_cast<void**>(entryAddr + 0x10);
+        if (!IsValidPtr(enemy) || enemy == localPlayer) continue;
+        if (fn_IsTeammate(enemy, nullptr)) continue;
+        if (fn_IsDead(enemy, nullptr) || fn_IsDieing(enemy, nullptr)) continue;
+
+        void* boneTf = (g_cfg.bone == 1) ? fn_GetHipTF(enemy, nullptr) : fn_GetHeadTF(enemy, nullptr);
+        if (!IsValidPtr(boneTf)) boneTf = fn_GetHeadTF(enemy, nullptr);
+        if (!IsValidPtr(boneTf)) continue;
+
+        Vector3 targetPos = fn_Tf_get_pos(boneTf, nullptr);
+        Vector3 sp = fn_Camera_W2S(cam, targetPos, nullptr);
+        if (sp.z <= 0.1f) continue;
+
+        float dx = sp.x - cx;
+        float dy = sp.y - cy;
+        float dist = sqrtf(dx * dx + dy * dy);
+        if (dist < bestDist) {
+            bestDist  = dist;
+            bestEnemy = enemy;
+            bestPos   = targetPos;
         }
     }
-    void *iter = nullptr;
-    while (auto itf = il2cpp_class_get_interfaces(klass, &iter)) {
-        extends.emplace_back(il2cpp_class_get_name(itf));
-    }
-    if (!extends.empty()) {
-        outPut << " : " << extends[0];
-        for (int i = 1; i < extends.size(); ++i) {
-            outPut << ", " << extends[i];
-        }
-    }
-    outPut << "\n{";
-    outPut << dump_field(klass);
-    outPut << dump_property(klass);
-    outPut << dump_method(klass);
-    //TODO EventInfo
-    outPut << "}\n";
-    return outPut.str();
+
+    if (!bestEnemy) return;
+
+    Vector3 dir = { bestPos.x - camPos.x, bestPos.y - camPos.y, bestPos.z - camPos.z };
+    float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (len < 0.01f) return;
+    dir.x /= len; dir.y /= len; dir.z /= len;
+
+    Quaternion targetRot = fn_Quat_LookRot(dir, nullptr);
+    Quaternion finalRot  = (g_cfg.smooth >= 0.99f)
+        ? targetRot
+        : fn_Quat_Slerp(camRot, targetRot, g_cfg.smooth, nullptr);
+
+    fn_SetAimRotation(localPlayer, finalRot, false, nullptr);
 }
+
+static void Hook_MainLoop(void* instance, const void* method) {
+    if (orig_UpdateHook) orig_UpdateHook(instance, method);
+    RunAimbot(instance);
+}
+
+static bool InstallMethodInfoHook() {
+    using FnDomainGet   = void* (*)();
+    using FnGetAsms     = void** (*)(void*, size_t*);
+    using FnAsmGetImg   = void* (*)(void*);
+    using FnClsFromName = void* (*)(void*, const char*, const char*);
+    using FnGetMethod   = void* (*)(void*, const char*, int);
+
+    auto fDomain   = reinterpret_cast<FnDomainGet>(xdl_sym(g_il2cpp_handle, "il2cpp_domain_get", nullptr));
+    auto fAsms     = reinterpret_cast<FnGetAsms>(xdl_sym(g_il2cpp_handle, "il2cpp_domain_get_assemblies", nullptr));
+    auto fImg      = reinterpret_cast<FnAsmGetImg>(xdl_sym(g_il2cpp_handle, "il2cpp_assembly_get_image", nullptr));
+    auto fCls      = reinterpret_cast<FnClsFromName>(xdl_sym(g_il2cpp_handle, "il2cpp_class_from_name", nullptr));
+    auto fMtd      = reinterpret_cast<FnGetMethod>(xdl_sym(g_il2cpp_handle, "il2cpp_class_get_method_from_name", nullptr));
+
+    if (!fDomain || !fAsms || !fImg || !fCls || !fMtd) {
+        LOGE("[FFAim] Thieu IL2CPP API symbol!");
+        return false;
+    }
+
+    void* domain = fDomain();
+    size_t n = 0;
+    void** asms = fAsms(domain, &n);
+    void* targetAddr = reinterpret_cast<void*>(g_base + OFF_HOOK_RVA);
+
+    for (size_t i = 0; i < n; ++i) {
+        void* img = fImg(asms[i]);
+        if (!img) continue;
+        void* klass = fCls(img, HOOK_NS, HOOK_CLASS);
+        if (!klass) continue;
+        void* methodInfo = fMtd(klass, HOOK_METHOD, 0);
+        if (!methodInfo) continue;
+
+        void** slots = reinterpret_cast<void**>(methodInfo);
+        bool hooked = false;
+        for (int k = 0; k < 4; ++k) {
+            if (slots[k] == targetAddr) {
+                orig_UpdateHook = reinterpret_cast<FnUpdateHook>(slots[k]);
+                slots[k] = reinterpret_cast<void*>(&Hook_MainLoop);
+                hooked = true;
+            }
+        }
+        if (hooked) {
+            LOGI("[FFAim] HOOK THANH CONG %s.%s::%s @ 0x%lx", HOOK_NS, HOOK_CLASS, HOOK_METHOD, (unsigned long)OFF_HOOK_RVA);
+            return true;
+        }
+    }
+    LOGE("[FFAim] Khong tim thay MethodInfo %s.%s::%s", HOOK_NS, HOOK_CLASS, HOOK_METHOD);
+    return false;
+}
+
+#endif
 
 void il2cpp_api_init(void *handle) {
-    LOGI("il2cpp_handle: %p", handle);
-    init_il2cpp_api(handle);
-    if (il2cpp_domain_get_assemblies) {
-        Dl_info dlInfo;
-        if (dladdr((void *) il2cpp_domain_get_assemblies, &dlInfo)) {
-            il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
-        }
-        LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
-    } else {
-        LOGE("Failed to initialize il2cpp api.");
-        return;
-    }
-    while (!il2cpp_is_vm_thread(nullptr)) {
-        LOGI("Waiting for il2cpp_init...");
-        sleep(1);
-    }
-    auto domain = il2cpp_domain_get();
-    il2cpp_thread_attach(domain);
+    g_il2cpp_handle = handle;
 }
 
 void il2cpp_dump(const char *outDir) {
-    LOGI("dumping...");
-    size_t size;
-    auto domain = il2cpp_domain_get();
-    auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
-    std::stringstream imageOutput;
-    for (int i = 0; i < size; ++i) {
-        auto image = il2cpp_assembly_get_image(assemblies[i]);
-        imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
+    (void)outDir;
+#if defined(__aarch64__)
+    LOGI("[FFAim] Khoi dong co che Ghim Tam (ARM64 Internal)...");
+    g_base = GetLibBase("libil2cpp.so");
+    if (!g_base) {
+        LOGE("[FFAim] Khong tim thay base libil2cpp.so!");
+        return;
     }
-    std::vector<std::string> outPuts;
-    if (il2cpp_image_get_class) {
-        LOGI("Version greater than 2018.3");
-        //使用il2cpp_image_get_class
-        for (int i = 0; i < size; ++i) {
-            auto image = il2cpp_assembly_get_image(assemblies[i]);
-            std::stringstream imageStr;
-            imageStr << "\n// Dll : " << il2cpp_image_get_name(image);
-            auto classCount = il2cpp_image_get_class_count(image);
-            for (int j = 0; j < classCount; ++j) {
-                auto klass = il2cpp_image_get_class(image, j);
-                auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
-                //LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
-                outPuts.push_back(outPut);
-            }
-        }
-    } else {
-        LOGI("Version less than 2018.3");
-        //使用反射
-        auto corlib = il2cpp_get_corlib();
-        auto assemblyClass = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
-        auto assemblyLoad = il2cpp_class_get_method_from_name(assemblyClass, "Load", 1);
-        auto assemblyGetTypes = il2cpp_class_get_method_from_name(assemblyClass, "GetTypes", 0);
-        if (assemblyLoad && assemblyLoad->methodPointer) {
-            LOGI("Assembly::Load: %p", assemblyLoad->methodPointer);
-        } else {
-            LOGI("miss Assembly::Load");
-            return;
-        }
-        if (assemblyGetTypes && assemblyGetTypes->methodPointer) {
-            LOGI("Assembly::GetTypes: %p", assemblyGetTypes->methodPointer);
-        } else {
-            LOGI("miss Assembly::GetTypes");
-            return;
-        }
-        typedef void *(*Assembly_Load_ftn)(void *, Il2CppString *, void *);
-        typedef Il2CppArray *(*Assembly_GetTypes_ftn)(void *, void *);
-        for (int i = 0; i < size; ++i) {
-            auto image = il2cpp_assembly_get_image(assemblies[i]);
-            std::stringstream imageStr;
-            auto image_name = il2cpp_image_get_name(image);
-            imageStr << "\n// Dll : " << image_name;
-            //LOGD("image name : %s", image->name);
-            auto imageName = std::string(image_name);
-            auto pos = imageName.rfind('.');
-            auto imageNameNoExt = imageName.substr(0, pos);
-            auto assemblyFileName = il2cpp_string_new(imageNameNoExt.data());
-            auto reflectionAssembly = ((Assembly_Load_ftn) assemblyLoad->methodPointer)(nullptr,
-                                                                                        assemblyFileName,
-                                                                                        nullptr);
-            auto reflectionTypes = ((Assembly_GetTypes_ftn) assemblyGetTypes->methodPointer)(
-                    reflectionAssembly, nullptr);
-            auto items = reflectionTypes->vector;
-            for (int j = 0; j < reflectionTypes->max_length; ++j) {
-                auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *) items[j]);
-                auto type = il2cpp_class_get_type(klass);
-                //LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
-                outPuts.push_back(outPut);
-            }
-        }
+    LOGI("[FFAim] libil2cpp.so base = 0x%lx", (unsigned long)g_base);
+
+    fn_Camera_get_main = reinterpret_cast<FnVoidVoid>(g_base + OFF_CAMERA_GET_MAIN);
+    fn_Camera_W2S      = reinterpret_cast<FnW2S>(g_base + OFF_CAMERA_W2S);
+    fn_Comp_get_tf     = reinterpret_cast<FnVoidPtr>(g_base + OFF_COMP_GET_TF);
+    fn_Tf_get_pos      = reinterpret_cast<FnVec3Ptr>(g_base + OFF_TF_GET_POS);
+    fn_Tf_get_rot      = reinterpret_cast<FnQuatPtr>(g_base + OFF_TF_GET_ROT);
+    fn_Quat_LookRot    = reinterpret_cast<FnLookRot>(g_base + OFF_QUAT_LOOKROT);
+    fn_Quat_Slerp      = reinterpret_cast<FnSlerp>(g_base + OFF_QUAT_SLERP);
+    if (OFF_SCREEN_GET_W) fn_Screen_W = reinterpret_cast<FnIntVoid>(g_base + OFF_SCREEN_GET_W);
+    if (OFF_SCREEN_GET_H) fn_Screen_H = reinterpret_cast<FnIntVoid>(g_base + OFF_SCREEN_GET_H);
+
+    fn_CurrentMatch    = reinterpret_cast<FnVoidVoid>(g_base + OFF_CURRENT_MATCH);
+    fn_IsTeammate      = reinterpret_cast<FnBoolPtr>(g_base + OFF_IS_TEAMMATE);
+    fn_IsDieing        = reinterpret_cast<FnBoolPtr>(g_base + OFF_PLAYER_IS_DIEING);
+    fn_IsDead          = reinterpret_cast<FnBoolPtr>(g_base + OFF_ENTITY_IS_DEAD);
+    fn_GetHeadTF       = reinterpret_cast<FnVoidPtr>(g_base + OFF_PLAYER_GET_HEAD);
+    fn_GetHipTF        = reinterpret_cast<FnVoidPtr>(g_base + OFF_PLAYER_GET_HIP);
+    fn_SetAimRotation  = reinterpret_cast<FnSetAim>(g_base + OFF_PLAYER_SET_AIM);
+
+    ReloadConfig();
+    for (int retry = 0; retry < 15; ++retry) {
+        if (InstallMethodInfoHook()) break;
+        sleep(1);
     }
-    LOGI("write dump file");
-    auto outPath = std::string(outDir).append("/files/dump.cs");
-    std::ofstream outStream(outPath);
-    outStream << imageOutput.str();
-    auto count = outPuts.size();
-    for (int i = 0; i < count; ++i) {
-        outStream << outPuts[i];
-    }
-    outStream.close();
-    LOGI("dump done!");
+#endif
 }
